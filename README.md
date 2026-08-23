@@ -69,7 +69,7 @@ Each provider is an OpenAI-compatible chat-completions endpoint:
 
 | Field     | Meaning                                            |
 | --------- | -------------------------------------------------- |
-| `baseUrl` | chat-completions URL (e.g. dots.ai's)              |
+| `baseUrl` | OpenAI-compatible base URL, e.g. `https://host/v1` (code appends `/chat/completions`) |
 | `apiKey`  | bearer token (optional for some endpoints)         |
 | `model`   | multimodal model id understood by the endpoint     |
 
@@ -176,7 +176,7 @@ Precedence (highest first): **environment variables → persisted JSON
 | `MULTI_CONTENT_PROXY_INCLUDE_CONTEXT`            | `true` \| `false`               |
 | `MULTI_CONTENT_PROXY_ENABLE_IMAGE/AUDIO/VIDEO`   | per-kind enable toggles         |
 
-Defaults: mode `fallback`, image base URL `https://dots.ai/api/v1/chat/completions`,
+Defaults: mode `fallback`, image base URL `https://note3-prev-api.askdiandian.com/v1` (code appends `/chat/completions`),
 image model `dots3-note-prev`.
 
 ## Privacy & consent
@@ -211,7 +211,7 @@ Media is mapped to the canonical OpenAI-compatible multimodal content-part forma
 
 The reference endpoint is dots.ai's platform API. Working configuration (also the default `image` provider):
 
-- `baseUrl`: `https://note3-prev-api.askdiandian.com/v1/chat/completions`
+- `baseUrl`: `https://note3-prev-api.askdiandian.com/v1`
 - `model`: `dots3-note-prev`
 - `apiKey`: a dots-ai API key (bearer token)
 

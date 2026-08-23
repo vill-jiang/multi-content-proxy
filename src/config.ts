@@ -56,8 +56,10 @@ export interface MultiContentConfig {
   maxFrames: number;
 }
 
-/** dots.ai platform docs describe an OpenAI-compatible endpoint; override to taste. */
-export const DEFAULT_IMAGE_BASE_URL = "https://dots.ai/api/v1/chat/completions";
+/** OpenAI-compatible base URL (the `…/v1` root). The request path
+ *  (`/chat/completions`, `/audio/transcriptions`) is appended in proxy.ts.
+ *  Override via MULTI_CONTENT_PROXY_*_BASE_URL or the persisted JSON config. */
+export const DEFAULT_IMAGE_BASE_URL = "https://note3-prev-api.askdiandian.com/v1";
 export const DEFAULT_IMAGE_MODEL = "dots3-note-prev";
 
 export const DEFAULT_IMAGE_PROVIDER: ProviderConfig = {

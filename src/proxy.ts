@@ -18,6 +18,16 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+/** Normalize a provider baseUrl to a specific OpenAI-style sub-path.
+ *  Older persisted configs baked `/chat/completions` (or `/audio/transcriptions`)
+ *  into baseUrl; strip any such trailing segment so the correct path can be
+ *  appended consistently. OpenAI convention: baseUrl is `…/v1` and the request
+ *  path is added here. */
+function endpointUrl(baseUrl: string, path: string): string {
+  const base = baseUrl.replace(/\/(chat\/completions|audio\/transcriptions)\/?$/i, "");
+  return base.replace(/\/+$/, "") + "/" + path;
+}
+
 /** Pull text out of an OpenAI-style message (string or content-array). */
 function extractText(message: any): string {
   if (!message || typeof message !== "object") return "";
@@ -64,8 +74,9 @@ export async function callMultimodalProxy(opts: {
   };
 
   let res: Response;
+  const url = endpointUrl(provider.baseUrl, "chat/completions");
   try {
-    res = await fetch(provider.baseUrl, {
+    res = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -116,7 +127,7 @@ export async function callStt(opts: {
   signal?: AbortSignal;
 }): Promise<string> {
   const { provider, data, format, signal } = opts;
-  const url = provider.baseUrl.replace(/chat\/completions\/?$/i, "audio/transcriptions");
+  const url = endpointUrl(provider.baseUrl, "audio/transcriptions");
 
   const form = new FormData();
   form.append("model", provider.model);
