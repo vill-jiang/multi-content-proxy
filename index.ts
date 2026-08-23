@@ -1,0 +1,692 @@
+/**
+ * multi-content-proxy — a pi extension that parses image, audio, and video
+ * file inputs and forwards them to an OpenAI-compatible multimodal endpoint
+ * (dots.ai / OpenRouter / vLLM / Ollama) so a text-only model can still
+ * reason about them.
+ *
+ * Inspired by the vision-proxy plugin (which handles images) but generalizes
+ * to audio and video as well, matching dots.ai's platform docs where a single
+ * messages array accepts text + image + video + audio input.
+ *
+ * Flow:
+ *   1. The `input` hook scans the user prompt and any attached images for media.
+ *   2. Each media file is read/encoded (video → ffmpeg frames + audio track).
+ *   3. The rich content parts are sent to the proxy, which returns a
+ *      description / transcript.
+ *   4. That text is injected back into the prompt as a <multi_content_proxy>
+ *      block, so the (possibly non-multimodal) main model can use it.
+ *   5. An on-demand `analyze_media` tool does the same for follow-up questions
+ *      and supports image cropping + per-video frame sampling.
+ *
+ * Install / load:
+ *   pi -e ./index.ts
+ *   or copy this folder to ~/.pi/agent/extensions/multi-content-proxy/
+ */
+
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  InputEvent,
+  BeforeAgentStartEvent,
+  SessionStartEvent,
+} from "@earendil-works/pi-coding-agent";
+import type { ImageContent } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { basename, resolve, isAbsolute } from "node:path";
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+
+import {
+  resolveConfig,
+  savePersisted,
+  providerFor,
+  type MultiContentConfig,
+  type ProxyMode,
+  type VideoStrategy,
+  type AudioStrategy,
+} from "./src/config.js";
+import {
+  extractCandidatePaths,
+  mediaFromAttachment,
+  buildParts,
+  readMediaBytes,
+  cropImageFile,
+  audioFormatFromMime,
+  ffmpegAvailable,
+  getMediaDuration,
+  extractAudioSegments,
+  classifyExt,
+  type CropSpec,
+  type MediaFile,
+  type MediaKind,
+} from "./src/media.js";
+import { callMultimodalProxy, callStt } from "./src/proxy.js";
+import type { MediaPart } from "./src/types.js";
+
+// ── Constants & per-session state ───────────────────────────────────────────
+
+/** Maximum analyze_media calls per agent turn (cost runaway guard). */
+const MAX_TOOL_CALLS_PER_TURN = 10;
+const TOOL_CACHE_SIZE = 50;
+
+class LRU<V> {
+  private map = new Map<string, V>();
+  constructor(private cap: number) {}
+  get(k: string): V | undefined {
+    const v = this.map.get(k);
+    if (v === undefined) return undefined;
+    this.map.delete(k);
+    this.map.set(k, v);
+    return v;
+  }
+  set(k: string, v: V): void {
+    if (this.map.has(k)) this.map.delete(k);
+    this.map.set(k, v);
+    if (this.map.size > this.cap) {
+      const first = this.map.keys().next().value;
+      if (first !== undefined) this.map.delete(first as string);
+    }
+  }
+}
+
+interface SessionState {
+  toolCache: LRU<string, string>;
+  toolCallCount: number;
+}
+
+const sessionStates = new WeakMap<object, SessionState>();
+
+function getSessionState(ctx: ExtensionContext): SessionState {
+  const key = ctx.sessionManager as unknown as object;
+  let s = sessionStates.get(key);
+  if (!s) {
+    s = { toolCache: new LRU<string, string>(TOOL_CACHE_SIZE), toolCallCount: 0 };
+    sessionStates.set(key, s);
+  }
+  return s;
+}
+
+// ── Prompts & rendering ─────────────────────────────────────────────────────
+
+function defaultMediaPrompt(kind: MediaKind): string {
+  if (kind === "image") {
+    return "Describe this image in detail and factually. Transcribe all visible text, code, UI labels, numbers, diagrams, and the spatial layout. If it is a screenshot, name the app and note any errors or warnings.";
+  }
+  if (kind === "audio") {
+    return "Transcribe this audio verbatim. Mark distinct speakers if identifiable (e.g. Speaker 1 / Speaker 2). Then add a one-line topic summary.";
+  }
+  return "These are sampled frames and the audio track from a video. Describe what happens across the frames in chronological order, transcribe any speech, and give a concise summary of the video's content and any on-screen text.";
+}
+
+function buildMediaContextBlock(results: { label: string; kind: MediaKind; text: string }[]): string {
+  const body = results.map((r) => `### ${r.kind}: ${r.label}\n${r.text}`).join("\n\n");
+  return (
+    "<multi_content_proxy>\n" +
+    "The following media were parsed by a multimodal proxy and described/transcribed as text so you can reason about them (they are not natively attached):\n\n" +
+    body +
+    "\n</multi_content_proxy>"
+  );
+}
+
+function maskKey(key: string): string {
+  if (!key) return "(none)";
+  return key.length <= 8 ? "****" : key.slice(0, 4) + "****" + key.slice(-4);
+}
+
+// ── Core processing ─────────────────────────────────────────────────────────
+
+/**
+ * Send one media item to the proxy and return the resulting text.
+ * Audio + transcribe strategy uses the dedicated STT endpoint.
+ * Long audio (>AUDIO_CHUNK_SECONDS) is chunked — dots.ai returns an empty
+ * response for a single huge audio payload — then merged.
+ */
+const AUDIO_CHUNK_SECONDS = 110; // dots-ai audio chunk threshold
+
+async function callForMedia(
+  media: MediaFile,
+  prompt: string,
+  config: MultiContentConfig,
+  ctx: ExtensionContext,
+  opts: { frames?: number } = {},
+): Promise<string> {
+  const provider = providerFor(media.kind, config);
+  if (media.kind === "audio" && config.audioStrategy === "transcribe") {
+    let data = media.data;
+    let format = audioFormatFromMime(media.mimeType || "audio/mpeg");
+    if (media.source === "path") {
+      const r = await readMediaBytes(media.path!, config);
+      data = r.data;
+      format = audioFormatFromMime(r.mimeType);
+    } else if (media.source === "attachment") {
+      format = audioFormatFromMime(media.mimeType || "audio/mpeg");
+    } else {
+      throw new Error("cannot transcribe a remote audio URL (download it first)");
+    }
+    return callStt({ provider, data: data!, format, signal: ctx.signal });
+  }
+
+  // Long audio: chunk into <=AUDIO_CHUNK_SECONDS slices so dots.ai doesn't drop
+  // the whole payload, analyze each, then merge.
+  if (media.kind === "audio" && media.source === "path") {
+    const dur = await getMediaDuration(media.path!, config.ffmpegPath, ctx.signal);
+    if (dur && dur > AUDIO_CHUNK_SECONDS) {
+      const segs = await extractAudioSegments(media.path!, AUDIO_CHUNK_SECONDS, config.ffmpegPath, ctx.signal);
+      const out: string[] = [];
+      for (let i = 0; i < segs.length; i++) {
+        const parts: MediaPart[] = [
+          { type: "text", text: `${prompt} (segment ${i + 1}/${segs.length})` },
+          { type: "audio_url", audio_url: { url: `data:${segs[i].mimeType};base64,${segs[i].data}` } },
+        ];
+        const r = await callMultimodalProxy({ provider, parts, prompt, maxTokens: 8192, signal: ctx.signal });
+        out.push(r.text);
+      }
+      return out.join("\n\n— — —\n\n");
+    }
+  }
+
+  // Video: native→frames auto-fallback for large/rejected payloads.
+  if (media.kind === "video") return callVideo(media, prompt, config, ctx, opts);
+
+  const parts = await buildParts(media, config, { frames: opts.frames, signal: ctx.signal });
+  // dots.ai is a reasoning model: audio/video need a large budget or it spends
+  // it all thinking and returns empty content.
+  const maxTokens = media.kind === "audio" ? 8192 : 4096;
+  const r = await callMultimodalProxy({ provider, parts, prompt, maxTokens, signal: ctx.signal });
+  return r.text;
+}
+
+/** Video: prefer native (whole clip → best motion understanding) but fall back
+ *  to frames if the provider rejects the large video_url payload (dots.ai
+ *  returns HTTP 400 for big files). Returns the first successful description. */
+async function callVideo(
+  media: MediaFile,
+  prompt: string,
+  config: MultiContentConfig,
+  ctx: ExtensionContext,
+  opts: { frames?: number } = {},
+): Promise<string> {
+  const provider = providerFor("video", config);
+  const strategies: VideoStrategy[] = config.videoStrategy === "native" ? ["native", "frames"] : ["frames"];
+  let lastErr: any;
+  for (const strat of strategies) {
+    try {
+      const parts = await buildParts(media, { ...config, videoStrategy: strat }, { frames: opts.frames, signal: ctx.signal });
+      const r = await callMultimodalProxy({ provider, parts, prompt, maxTokens: 8192, signal: ctx.signal });
+      return r.text;
+    } catch (e: any) {
+      lastErr = e;
+      if (strategies.length > 1) {
+        ctx.ui.notify(`[multi-content-proxy] video ${strat} failed (${e?.message ?? e}); retrying with frames…`, "warning");
+      }
+    }
+  }
+  throw lastErr ?? new Error("video analysis failed");
+}
+
+/** First-use data-egress consent gate. */
+async function ensureConsent(ctx: ExtensionContext, config: MultiContentConfig): Promise<boolean> {
+  if (config.consent === "yes") return true;
+  if (config.consent === "no") return false;
+  if (!ctx.hasUI) return false;
+  const ok = await ctx.ui.confirm(
+    "multi-content-proxy",
+    "Send the referenced media files to the configured multimodal proxy to describe/transcribe them?",
+  );
+  if (ok) await savePersisted({ consent: "yes" });
+  return ok;
+}
+
+// ── Extension entry point ───────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+  // Reset per-turn tool-call counter.
+  pi.on("before_agent_start", (_event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
+    getSessionState(ctx).toolCallCount = 0;
+  });
+
+  // Steady status line.
+  pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => {
+    const config = resolveConfig();
+    if (config.mode !== "off" && config.statusLine === "on") {
+      ctx.ui.setStatus(
+        "multi-content-proxy",
+        "📎",
+      );
+    } else {
+      ctx.ui.setStatus("multi-content-proxy", undefined);
+    }
+  });
+
+  // ── Input hook: parse media referenced in the prompt / attachments ────────
+  pi.on("input", async (event: InputEvent, ctx: ExtensionContext) => {
+    const config = resolveConfig();
+    if (config.mode === "off") return { action: "continue" };
+    if (event.source === "extension") return { action: "continue" };
+
+    const modelInput = (ctx.model?.input as string[] | undefined) ?? [];
+    const modelSupportsImage = modelInput.includes("image");
+
+    // Gather candidates.
+    const candidates: MediaFile[] = [];
+    for (const img of event.images ?? []) {
+      if (config.enableImage) candidates.push(mediaFromAttachment(img as ImageContent));
+    }
+    for (const c of extractCandidatePaths(event.text, ctx.cwd)) {
+      if (c.kind === "image" && config.enableImage) candidates.push(c);
+      else if (c.kind === "audio" && config.enableAudio) candidates.push(c);
+      else if (c.kind === "video" && config.enableVideo) candidates.push(c);
+    }
+    if (candidates.length === 0) return { action: "continue" };
+
+    // In fallback mode, leave natively-supported images alone.
+    let toProxy = candidates;
+    if (config.mode === "fallback") {
+      toProxy = candidates.filter((c) => !(c.kind === "image" && modelSupportsImage));
+    }
+    if (toProxy.length === 0) return { action: "continue" };
+
+    // Consent.
+    if (!(await ensureConsent(ctx, config))) {
+      ctx.ui.notify("[multi-content-proxy] media handling skipped (consent denied)", "warning");
+      return { action: "continue" };
+    }
+
+    // ffmpeg requirement for video frame extraction.
+    const needsFfmpeg = toProxy.some((c) => c.kind === "video" && config.videoStrategy === "frames");
+    if (needsFfmpeg && !(await ffmpegAvailable(config.ffmpegPath))) {
+      ctx.ui.notify("[multi-content-proxy] ffmpeg not found — switching video to native strategy", "warning");
+      config = { ...config, videoStrategy: "native" };
+    }
+
+    const results: { label: string; kind: MediaKind; text: string }[] = [];
+    for (const media of toProxy) {
+      if (!providerFor(media.kind, config).baseUrl) continue;
+      try {
+        const text = await callForMedia(media, defaultMediaPrompt(media.kind), config, ctx);
+        results.push({ label: media.label, kind: media.kind, text });
+      } catch (err: any) {
+        results.push({
+          label: media.label,
+          kind: media.kind,
+          text: `⚠️ failed to process: ${err?.message ?? err}`,
+        });
+      }
+    }
+
+    const block = buildMediaContextBlock(results);
+    const newText = event.text ? `${event.text}\n\n${block}` : block;
+
+    // If we described images but the model can't see them natively, drop the
+    // (useless) attachments and rely on the text description.
+    const proxiedImages = toProxy.some((c) => c.kind === "image");
+    const images = proxiedImages && !modelSupportsImage ? [] : event.images;
+
+    return { action: "transform", text: newText, images };
+  });
+
+  // ── On-demand analyze_media tool ───────────────────────────────────────────
+  const CropEntrySchema = Type.Union([
+    Type.Object({
+      image_index: Type.Integer({ minimum: 0 }),
+      region: Type.String({ description: "top-left|top-right|bottom-left|bottom-right|top|bottom|left|right|center|*-half" }),
+    }),
+    Type.Object({
+      image_index: Type.Integer({ minimum: 0 }),
+      normalized: Type.Object({ x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number() }),
+    }),
+    Type.Object({
+      image_index: Type.Integer({ minimum: 0 }),
+      pixels: Type.Object({ x: Type.Number(), y: Type.Number(), width: Type.Number(), height: Type.Number() }),
+    }),
+  ]);
+
+  pi.registerTool({
+    name: "analyze_media",
+    label: "Analyze Media",
+    description: [
+      "Use `analyze_media` to describe, transcribe, or ask a specific question about image, audio, or video files.",
+      "Pass file paths or http(s) URLs. Images can be cropped via `crop`; videos accept a `frames` sample count.",
+      "The tool sends the parsed media to the configured multimodal proxy and returns the model's text answer.",
+    ].join("\n"),
+    parameters: Type.Object({
+      media: Type.Array(Type.String(), {
+        description: "1..20 media references: local file paths or http(s) URLs (image/audio/video).",
+        minItems: 1,
+        maxItems: 20,
+      }),
+      question: Type.String({ description: "Question or instruction about the media. Required." }),
+      crop: Type.Optional(Type.Array(CropEntrySchema, { description: "Optional per-image crop, indexed by image_index." })),
+      frames: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "Frames to sample per video (frames strategy)." })),
+      reason: Type.Optional(Type.String({ description: "Optional; logged for analytics only." })),
+    }),
+    async execute(_toolCallId, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const config = resolveConfig();
+      if (config.mode === "off") {
+        return { content: [{ type: "text", text: "multi-content-proxy is disabled (mode=off)." }], details: {} };
+      }
+      const state = getSessionState(ctx);
+      if (state.toolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
+        return {
+          content: [{ type: "text", text: `analyze_media rate limit reached (${MAX_TOOL_CALLS_PER_TURN}/turn).` }],
+          details: {},
+        };
+      }
+      state.toolCallCount++;
+
+      if (!(await ensureConsent(ctx, config))) {
+        return { content: [{ type: "text", text: "Consent denied — cannot send media to the proxy." }], details: {} };
+      }
+      if (!config.image.baseUrl) {
+        return {
+          content: [{ type: "text", text: "multi-content-proxy image base URL is not configured. Set MULTI_CONTENT_PROXY_IMAGE_BASE_URL or use /multi-content-proxy image-base-url <url>." }],
+          details: {},
+        };
+      }
+
+      // Cache key.
+      const cacheKey = JSON.stringify({ m: params.media, q: params.question, c: params.crop, f: params.frames });
+      const cached = state.toolCache.get(cacheKey);
+      if (cached) return { content: [{ type: "text", text: cached }], details: {} };
+
+      // Resolve media refs.
+      const mediaList: MediaFile[] = [];
+      for (const ref of params.media as string[]) {
+        const s = ref.trim();
+        if (!s) continue;
+        if (/^https?:\/\//i.test(s)) {
+          const m = /\.([a-z0-9]+)$/i.exec(s);
+          const kind = m ? classifyExt("." + m[1]) : undefined;
+          if (kind) mediaList.push({ kind, url: s, label: s, source: "url" });
+          continue;
+        }
+        const resolved = resolveLocalMedia(s, ctx.cwd);
+        if (resolved) mediaList.push(resolved);
+        else ctx.ui.notify(`[multi-content-proxy] skipped unreadable media: ${s}`, "warning");
+      }
+      if (mediaList.length === 0) {
+        return { content: [{ type: "text", text: "No valid media references found." }], details: {} };
+      }
+
+      // Apply crops (images only).
+      if (params.crop && Array.isArray(params.crop)) {
+        if (await ffmpegAvailable(config.ffmpegPath)) {
+          for (const c of params.crop as CropSpec[]) {
+            const target = mediaList.filter((m) => m.kind === "image")[c.image_index];
+            if (target && target.source === "path") {
+              try {
+                const cropped = await cropImageFile(target.path!, c, config.ffmpegPath, ctx.signal);
+                target.path = cropped;
+              } catch (err: any) {
+                ctx.ui.notify(`[multi-content-proxy] crop failed: ${err?.message ?? err}`, "warning");
+              }
+            }
+          }
+        } else {
+          ctx.ui.notify("[multi-content-proxy] ffmpeg not found — ignoring crop", "warning");
+        }
+      }
+
+      // ffmpeg for video frames.
+      const needsFfmpeg = mediaList.some((m) => m.kind === "video" && config.videoStrategy === "frames");
+      let effective = config;
+      if (needsFfmpeg && !(await ffmpegAvailable(config.ffmpegPath))) {
+        ctx.ui.notify("[multi-content-proxy] ffmpeg missing — video uses native strategy", "warning");
+        effective = { ...config, videoStrategy: "native" };
+      }
+
+      try {
+        const answers: string[] = [];
+        for (const media of mediaList) {
+          const text = await callForMedia(media, params.question as string, effective, ctx, {
+            frames: params.frames as number | undefined,
+          });
+          answers.push(`### ${media.kind}: ${media.label}\n${text}`);
+        }
+        const out = answers.join("\n\n");
+        state.toolCache.set(cacheKey, out);
+        return { content: [{ type: "text", text: out }], details: {} };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `analyze_media failed: ${err?.message ?? err}` }],
+          details: { error: String(err?.message ?? err) },
+        };
+      }
+    },
+  });
+
+  // ── Configuration command ─────────────────────────────────────────────────
+  pi.registerCommand("multi-content-proxy", {
+    description: "Configure the multi-content-proxy (mode, model, endpoints, strategies).",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const trimmed = args.trim();
+      if (!trimmed) {
+        await showStatus(ctx);
+        return;
+      }
+      const [cmd, ...rest] = trimmed.split(/\s+/);
+      const arg = rest.join(" ");
+      try {
+        // --- mode ---
+        if (cmd === "off" || cmd === "fallback" || cmd === "always") {
+          await savePersisted({ mode: cmd as ProxyMode });
+          ctx.ui.notify(`multi-content-proxy mode → ${cmd}`, "info");
+          return;
+        }
+
+        // --- per-modality provider setters ---
+        // aliases: model/base-url/api-key  ->  image-*
+        const alias: Record<string, string> = {
+          model: "image-model",
+          "base-url": "image-base-url",
+          "api-key": "image-api-key",
+        };
+        const realCmd = alias[cmd] ?? cmd;
+        const provMatch = /^(image|audio|video)-(model|base-url|api-key)$/.exec(realCmd);
+        if (provMatch) {
+          const kind = provMatch[1] as MediaKind;
+          const field = provMatch[2] as "model" | "base-url" | "api-key";
+          const cfgField = field === "base-url" ? "baseUrl" : (field === "api-key" ? "apiKey" : "model");
+          if (!arg) {
+            ctx.ui.notify(`usage: /multi-content-proxy ${realCmd} <value>  (or 'clear' for audio/video to fall back to image)`, "warning");
+            return;
+          }
+          if (kind !== "image" && arg.toLowerCase() === "clear") {
+            await clearProvider(kind, ctx);
+            return;
+          }
+          await setProviderField(kind, cfgField, arg, ctx);
+          return;
+        }
+
+        // --- strategy / limits ---
+        if (cmd === "video-strategy") {
+          if (arg !== "native" && arg !== "frames") return ctx.ui.notify("video-strategy must be native|frames", "warning");
+          await savePersisted({ videoStrategy: arg as VideoStrategy });
+          ctx.ui.notify(`video-strategy → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "audio-strategy") {
+          if (arg !== "describe" && arg !== "transcribe") return ctx.ui.notify("audio-strategy must be describe|transcribe", "warning");
+          await savePersisted({ audioStrategy: arg as AudioStrategy });
+          ctx.ui.notify(`audio-strategy → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "max-frames") {
+          await savePersisted({ maxFrames: Math.max(1, parseInt(arg, 10) || 4) });
+          ctx.ui.notify(`max-frames → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "max-bytes") {
+          const bytes = parseMaxBytes(arg);
+          if (bytes === null) return ctx.ui.notify("max-bytes: use <n> (bytes) or <n>mb", "warning");
+          await savePersisted({ maxBytes: bytes });
+          ctx.ui.notify(`max-bytes → ${(bytes / 1024 / 1024).toFixed(1)}MB`, "info");
+          return;
+        }
+        if (cmd === "ffmpeg") {
+          if (!arg) return ctx.ui.notify("usage: /multi-content-proxy ffmpeg <path>", "warning");
+          await savePersisted({ ffmpegPath: arg });
+          ctx.ui.notify(`ffmpeg → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "status") {
+          if (arg !== "on" && arg !== "off") return ctx.ui.notify("status must be on|off", "warning");
+          await savePersisted({ statusLine: arg as "on" | "off" });
+          ctx.ui.notify(`status line → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "consent") {
+          if (arg !== "yes" && arg !== "no" && arg !== "ask") return ctx.ui.notify("consent must be yes|no|ask", "warning");
+          await savePersisted({ consent: arg as "yes" | "no" | "ask" });
+          ctx.ui.notify(`consent → ${arg}`, "info");
+          return;
+        }
+        if (cmd === "folders") {
+          await handleFolders(arg, ctx);
+          return;
+        }
+        if (cmd === "test") {
+          await runTest(arg, ctx);
+          return;
+        }
+        if (cmd === "reset-consent") {
+          await savePersisted({ consent: "ask" });
+          ctx.ui.notify("consent reset to ask", "info");
+          return;
+        }
+        ctx.ui.notify(`unknown subcommand: ${cmd}`, "warning");
+        await showStatus(ctx);
+      } catch (err: any) {
+        ctx.ui.notify(`multi-content-proxy error: ${err?.message ?? err}`, "error");
+      }
+    },
+  });
+}
+
+// ── Command helpers ─────────────────────────────────────────────────────────
+
+function classifyFromExt(ext: string): MediaKind | undefined {
+  return classifyExt(ext);
+}
+
+function resolveLocalMedia(ref: string, cwd: string): MediaFile | undefined {
+  let p = ref;
+  if (ref.startsWith("~")) p = resolve(homedir(), ref.slice(1));
+  else if (!isAbsolute(ref)) p = resolve(cwd, ref);
+  try {
+    if (!statSync(p).isFile()) return undefined;
+  } catch {
+    return undefined;
+  }
+  const m = /\.([a-z0-9]+)$/i.exec(p);
+  const kind = m ? classifyExt("." + m[1]) : undefined;
+  if (!kind) return undefined;
+  return { kind, path: p, label: basename(p), source: "path" };
+}
+
+function parseMaxBytes(arg: string): number | null {
+  const t = arg.trim().toLowerCase();
+  const mb = /^(\d+(?:\.\d+)?)\s*mb$/.exec(t);
+  if (mb) return Math.round(parseFloat(mb[1]) * 1024 * 1024);
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  return null;
+}
+
+/** Set one field of a modality provider, inheriting unset fields from the image (base) provider. */
+async function setProviderField(
+  kind: MediaKind,
+  field: "baseUrl" | "apiKey" | "model",
+  value: string,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const c = resolveConfig();
+  const current = kind === "image" ? c.image : kind === "audio" ? c.audio ?? c.image : c.video ?? c.image;
+  const merged = { ...c.image, ...current, [field]: value };
+  if (kind === "image") await savePersisted({ image: merged });
+  else if (kind === "audio") await savePersisted({ audio: merged });
+  else await savePersisted({ video: merged });
+  ctx.ui.notify(`${kind} ${field} saved`, "info");
+}
+
+/** Remove the dedicated audio/video provider so it falls back to the image provider. */
+async function clearProvider(kind: MediaKind, ctx: ExtensionContext): Promise<void> {
+  if (kind === "image") {
+    ctx.ui.notify("image is the base provider and cannot be cleared", "warning");
+    return;
+  }
+  if (kind === "audio") await savePersisted({ audio: undefined });
+  else await savePersisted({ video: undefined });
+  ctx.ui.notify(`${kind} provider cleared — now falls back to image`, "info");
+}
+
+async function showStatus(ctx: ExtensionContext): Promise<void> {
+  const c = resolveConfig();
+  const line = (label: string, p: { baseUrl: string; apiKey: string; model: string }, fallback?: boolean) =>
+    `  ${label.padEnd(7)} ${fallback ? "(fallback→image) " : ""}model=${p.model}  url=${p.baseUrl || "(not set)"}  key=${maskKey(p.apiKey)}`;
+  const lines = [
+    "multi-content-proxy",
+    `  mode:              ${c.mode}`,
+    line("image", c.image),
+    line("audio", c.audio ?? c.image, !c.audio),
+    line("video", c.video ?? c.image, !c.video),
+    `  image/audio/video: ${c.enableImage}/${c.enableAudio}/${c.enableVideo}`,
+    `  video-strategy:    ${c.videoStrategy}`,
+    `  audio-strategy:    ${c.audioStrategy}`,
+    `  max-bytes:         ${(c.maxBytes / 1024 / 1024).toFixed(1)}MB`,
+    `  max-frames:        ${c.maxFrames}`,
+    `  ffmpeg:            ${c.ffmpegPath}`,
+    `  consent:           ${c.consent}`,
+    `  status-line:       ${c.statusLine}`,
+  ];
+  ctx.ui.notify(lines.join("\n"), "info");
+}
+
+async function handleFolders(arg: string, ctx: ExtensionContext): Promise<void> {
+  const c = resolveConfig();
+  const [sub, ...rest] = arg.split(/\s+/);
+  const path = rest.join(" ");
+  if (sub === "clear") {
+    await savePersisted({ allowedFolders: [] });
+    ctx.ui.notify("allowed folders cleared (any readable file allowed)", "info");
+    return;
+  }
+  if (sub === "add" && path) {
+    const abs = resolve(path);
+    await savePersisted({ allowedFolders: [...new Set([...c.allowedFolders, abs])] });
+    ctx.ui.notify(`added allowed folder: ${abs}`, "info");
+    return;
+  }
+  if (sub === "remove" && path) {
+    const abs = resolve(path);
+    await savePersisted({ allowedFolders: c.allowedFolders.filter((f) => resolve(f) !== abs) });
+    ctx.ui.notify(`removed allowed folder: ${abs}`, "info");
+    return;
+  }
+  ctx.ui.notify(`allowed folders: ${c.allowedFolders.length ? c.allowedFolders.join(", ") : "(any)"}`, "info");
+}
+
+async function runTest(arg: string, ctx: ExtensionContext): Promise<void> {
+  if (!arg) return ctx.ui.notify("usage: /multi-content-proxy test <path|url>", "warning");
+  const c = resolveConfig();
+  const resolved = resolveLocalMedia(arg, ctx.cwd);
+  const media: MediaFile | undefined =
+    resolved ??
+    (/^https?:\/\//i.test(arg)
+      ? {
+          kind: (classifyExt("." + (/\.([a-z0-9]+)$/i.exec(arg)?.[1] ?? "")) || "image") as MediaKind,
+          url: arg,
+          label: arg,
+          source: "url",
+        }
+      : undefined);
+  if (!media) return ctx.ui.notify(`cannot resolve test target: ${arg}`, "warning");
+  if (!providerFor(media.kind, c).baseUrl) return ctx.ui.notify("base-url not configured", "warning");
+  ctx.ui.notify(`[multi-content-proxy] testing ${media.label} …`, "info");
+  try {
+    const text = await callForMedia(media, defaultMediaPrompt(media.kind), c, ctx);
+    ctx.ui.notify(`${media.label}:\n${text.slice(0, 4000)}`, "info");
+  } catch (err: any) {
+    ctx.ui.notify(`test failed: ${err?.message ?? err}`, "error");
+  }
+}

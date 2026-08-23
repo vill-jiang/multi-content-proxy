@@ -1,0 +1,40 @@
+{
+  "name": "multi-content-proxy",
+  "version": "1.0.0",
+  "description": "Pi agent extension that parses image/audio/video inputs and forwards them to an OpenAI-compatible multimodal proxy (e.g. dots.ai).",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-agent",
+    "pi-extension",
+    "multimodal",
+    "vision",
+    "audio",
+    "video",
+    "dots.ai"
+  ],
+  "author": "vill-jiang",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vill-jiang/multi-content-proxy"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md"
+  ],
+  "dependencies": {
+    "typebox": "^0.34.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
