@@ -10,13 +10,13 @@
  *
  * Flow:
  *   1. The `input` hook scans the user prompt and any attached images for media.
- *   2. Each media file is read/encoded (video → ffmpeg frames + audio track).
- *   3. The rich content parts are sent to the proxy, which returns a
- *      description / transcript.
- *   4. That text is injected back into the prompt as a <multi_content_proxy>
- *      block, so the (possibly non-multimodal) main model can use it.
- *   5. An on-demand `analyze_media` tool does the same for follow-up questions
- *      and supports image cropping + per-video frame sampling.
+ *   2. Rather than analyzing synchronously (slow → unresponsive), it injects a
+ *      short hint listing the media references and instructs the model to call
+ *      the `analyze_media` tool, so analysis happens in the model's own loop as
+ *      a visible, progress-reporting tool call.
+ *   3. The tool reads/encodes each media file (video → ffmpeg frames + audio
+ *      track), sends the rich content parts to the proxy, and returns a
+ *      description / transcript the model can use.
  *
  * Install / load:
  *   pi -e ./index.ts
@@ -32,9 +32,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { basename, resolve, isAbsolute } from "node:path";
+import { basename, resolve, isAbsolute, join } from "node:path";
 import { statSync } from "node:fs";
-import { homedir } from "node:os";
+import { writeFile, mkdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 
 import {
   resolveConfig,
@@ -118,14 +119,24 @@ function defaultMediaPrompt(kind: MediaKind): string {
   return "These are sampled frames and the audio track from a video. Describe what happens across the frames in chronological order, transcribe any speech, and give a concise summary of the video's content and any on-screen text.";
 }
 
-function buildMediaContextBlock(results: { label: string; kind: MediaKind; text: string }[]): string {
-  const body = results.map((r) => `### ${r.kind}: ${r.label}\n${r.text}`).join("\n\n");
-  return (
-    "<multi_content_proxy>\n" +
-    "The following media were parsed by a multimodal proxy and described/transcribed as text so you can reason about them (they are not natively attached):\n\n" +
-    body +
-    "\n</multi_content_proxy>"
-  );
+/** Materialize an attachment (which has no path/url) to a temp file so the
+ *  analyze_media tool can read it by reference. Returns the temp path, or
+ *  undefined if the media is not an analyzable attachment. */
+async function attachmentToTempPath(media: MediaFile): Promise<string | undefined> {
+  if (media.source !== "attachment" || !media.data) return undefined;
+  const mime = media.mimeType || "image/png";
+  const ext = mime.includes("jpeg") || mime.includes("jpg")
+    ? "jpg"
+    : mime.includes("gif")
+      ? "gif"
+      : mime.includes("webp")
+        ? "webp"
+        : "png";
+  const dir = join(tmpdir(), "multi-content-proxy");
+  await mkdir(dir, { recursive: true });
+  const p = join(dir, `attached-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+  await writeFile(p, Buffer.from(media.data, "base64"));
+  return p;
 }
 
 function maskKey(key: string): string {
@@ -258,11 +269,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── Input hook: parse media referenced in the prompt / attachments ────────
+  // ── Input hook: detect media and ask the model to analyze it via the tool ──
+  // We deliberately do NOT analyze media here — that work is slow and would
+  // make the user wait with no feedback. Instead we inject a short hint listing
+  // the media references and instruct the model to call `analyze_media` in its
+  // own loop, so analysis happens as a visible, progress-reporting tool call.
   pi.on("input", async (event: InputEvent, ctx: ExtensionContext) => {
     const config = resolveConfig();
     if (config.mode === "off") return { action: "continue" };
     if (event.source === "extension") return { action: "continue" };
+    if (config.consent === "no") return { action: "continue" };
 
     const modelInput = (ctx.model?.input as string[] | undefined) ?? [];
     const modelSupportsImage = modelInput.includes("image");
@@ -279,47 +295,43 @@ export default function (pi: ExtensionAPI) {
     }
     if (candidates.length === 0) return { action: "continue" };
 
-    // In fallback mode, leave natively-supported images alone.
-    let toProxy = candidates;
+    // Decide which media the model cannot ingest natively and must analyze via
+    // the tool. In fallback mode, natively-seen images stay as attachments.
+    let toolMedia = candidates;
     if (config.mode === "fallback") {
-      toProxy = candidates.filter((c) => !(c.kind === "image" && modelSupportsImage));
+      toolMedia = candidates.filter((c) => !(c.kind === "image" && modelSupportsImage));
     }
-    if (toProxy.length === 0) return { action: "continue" };
+    if (toolMedia.length === 0) return { action: "continue" };
 
-    // Consent.
-    if (!(await ensureConsent(ctx, config))) {
-      ctx.ui.notify("[multi-content-proxy] media handling skipped (consent denied)", "warning");
-      return { action: "continue" };
-    }
-
-    // ffmpeg requirement for video frame extraction.
-    const needsFfmpeg = toProxy.some((c) => c.kind === "video" && config.videoStrategy === "frames");
-    if (needsFfmpeg && !(await ffmpegAvailable(config.ffmpegPath))) {
-      ctx.ui.notify("[multi-content-proxy] ffmpeg not found — switching video to native strategy", "warning");
-      config = { ...config, videoStrategy: "native" };
-    }
-
-    const results: { label: string; kind: MediaKind; text: string }[] = [];
-    for (const media of toProxy) {
-      if (!providerFor(media.kind, config).baseUrl) continue;
-      try {
-        const text = await callForMedia(media, defaultMediaPrompt(media.kind), config, ctx);
-        results.push({ label: media.label, kind: media.kind, text });
-      } catch (err: any) {
-        results.push({
-          label: media.label,
-          kind: media.kind,
-          text: `⚠️ failed to process: ${err?.message ?? err}`,
-        });
+    // Resolve each to a reference the model can pass to analyze_media.
+    // Attachments (no path/url) are materialized to a temp file first.
+    const refs: string[] = [];
+    for (const media of toolMedia) {
+      if (media.source === "attachment") {
+        const tmp = await attachmentToTempPath(media);
+        if (tmp) refs.push(`- ${media.kind}: ${tmp}`);
+      } else if (media.url) {
+        refs.push(`- ${media.kind}: ${media.url}`);
+      } else if (media.path) {
+        refs.push(`- ${media.kind}: ${media.path}`);
       }
     }
+    if (refs.length === 0) return { action: "continue" };
 
-    const block = buildMediaContextBlock(results);
-    const newText = event.text ? `${event.text}\n\n${block}` : block;
+    const hint =
+      "<multi_content_proxy>\n" +
+      "The user referenced media that cannot be ingested natively. To perceive it, " +
+      "call the `analyze_media` tool with the references below (pair each with a " +
+      "question suited to the user's request). Analyze before answering whenever " +
+      "the media is relevant:\n" +
+      refs.join("\n") +
+      "\n</multi_content_proxy>";
 
-    // If we described images but the model can't see them natively, drop the
-    // (useless) attachments and rely on the text description.
-    const proxiedImages = toProxy.some((c) => c.kind === "image");
+    const newText = event.text ? `${event.text}\n\n${hint}` : hint;
+
+    // If images are being proxied (model can't see them natively), drop the raw
+    // attachments so we don't send the same image twice.
+    const proxiedImages = toolMedia.some((c) => c.kind === "image");
     const images = proxiedImages && !modelSupportsImage ? [] : event.images;
 
     return { action: "transform", text: newText, images };
