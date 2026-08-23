@@ -574,7 +574,6 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
-}
 
   // ── Natural-language configuration tool ─────────────────────────────────────
   // Lets the user configure the extension just by telling the assistant, e.g.
@@ -663,6 +662,7 @@ export default function (pi: ExtensionAPI) {
       pi.setActiveTools([...active, "configure_multi_content_proxy"]);
     }
   });
+}
 
 // ── Command helpers ─────────────────────────────────────────────────────────
 

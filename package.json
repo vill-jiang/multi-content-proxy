@@ -1,6 +1,6 @@
 {
   "name": "multi-content-proxy",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Pi agent extension that parses image/audio/video inputs and forwards them to an OpenAI-compatible multimodal proxy (e.g. dots.ai).",
   "type": "module",
   "main": "index.ts",
