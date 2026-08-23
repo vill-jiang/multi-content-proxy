@@ -153,6 +153,23 @@ The agent can call `analyze_media` to inspect specific files or URLs on demand:
 
 ## Configuration
 
+### Configure by just telling the assistant (recommended)
+
+You don't need to edit files or run commands. After installing the extension, simply
+tell the assistant in natural language and it configures itself via the
+`configure_multi_content_proxy` tool:
+
+> 帮我配置拓展 multi-content-proxy 的 baseurl 为 https://note3-prev-api.askdiandian.com/v1 模型名为 dots3-note-prev APIKEY为 ak_xxxxxxxx
+
+The English equivalent works too:
+
+> configure multi-content-proxy with baseurl https://note3-prev-api.askdiandian.com/v1, model dots3-note-prev, apikey ak_xxx
+
+The tool writes `baseUrl`, `model` (image + video) and `apiKey` to
+`~/.pi/agent/multi-content-proxy.json`. A trailing `/chat/completions` is stripped
+automatically, and `audio`/`video` inherit from `image` unless already set. Optional
+`consent` / `mode` can also be supplied.
+
 Precedence (highest first): **environment variables → persisted JSON
 (`~/.pi/agent/multi-content-proxy.json`) → built-in defaults**.
 
@@ -196,7 +213,7 @@ src/media.ts    path/URL/attachment extraction, size+folder guards, ffmpeg frame
                 long-audio chunking, buildParts() → OpenAI multimodal content parts
                 (image_url / video_url / audio_url)
 src/proxy.ts    callMultimodalProxy() (chat/completions) + callStt() (audio/transcriptions)
-index.ts        <input> hook (auto media), analyze_media tool, /multi-content-proxy command,
+index.ts        <input> hook (auto media), analyze_media + configure_multi_content_proxy tools, /multi-content-proxy command,
                 before_agent_start / session_start hooks, consent + rate-limit + LRU cache
 ```
 

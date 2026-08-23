@@ -576,6 +576,94 @@ export default function (pi: ExtensionAPI) {
   });
 }
 
+  // ── Natural-language configuration tool ─────────────────────────────────────
+  // Lets the user configure the extension just by telling the assistant, e.g.
+  // "帮我配置 multi-content-proxy 的 baseurl 为 …/v1 模型名为 dots3-note-prev
+  //  APIKEY为 ak_xxx". The model parses that into this tool call.
+  function normalizeBaseUrl(u: string): string {
+    let s = (u || "").trim();
+    if (s.endsWith("/chat/completions")) s = s.slice(0, -"/chat/completions".length);
+    else if (s.endsWith("/audio/transcriptions")) s = s.slice(0, -"/audio/transcriptions".length);
+    if (s.endsWith("/")) s = s.slice(0, -1);
+    return s;
+  }
+
+  // Only register the configuration tool when the extension is NOT yet configured,
+  // so it never appears in the model's context once setup is complete.
+  const isConfigured = (c: ReturnType<typeof resolveConfig>): boolean => !!(c.image.baseUrl && c.image.apiKey);
+  const configuredAtLoad = isConfigured(resolveConfig());
+
+  if (!configuredAtLoad) {
+  pi.tool({
+    name: "configure_multi_content_proxy",
+    description: [
+      "Configure the multi-content-proxy pi extension by setting its API endpoint, model, and key.",
+      "Call this whenever the user asks to set up / configure multi-content-proxy, or supplies its base URL, model name, or API key — including in natural language such as '帮我配置拓展 multi-content-proxy 的 baseurl 为 https://note3-prev-api.askdiandian.com/v1 模型名为 dots3-note-prev APIKEY为 ak_xxx'.",
+      "baseUrl is the OpenAI-compatible …/v1 root (a trailing /chat/completions is stripped automatically). model is the multimodal model id (applied to image + video). apiKey is applied globally and to all providers. audio/video inherit from image unless they were already configured separately.",
+    ].join(" "),
+    input: {
+      baseUrl: Type.Optional(Type.String({ description: "OpenAI-compatible base URL ending in /v1, e.g. https://note3-prev-api.askdiandian.com/v1" })),
+      model: Type.Optional(Type.String({ description: "Multimodal model id, e.g. dots3-note-prev. Applied to image + video providers." })),
+      apiKey: Type.Optional(Type.String({ description: "API key for the endpoint, e.g. ak_xxx." })),
+      consent: Type.Optional(Type.Union([Type.Literal("yes"), Type.Literal("no"), Type.Literal("ask")], { description: "Media egress consent: yes | no | ask." })),
+      mode: Type.Optional(Type.Union([Type.Literal("always"), Type.Literal("fallback"), Type.Literal("off")], { description: "Proxy mode: always | fallback | off." })),
+    },
+    execute: async (params, ctx) => {
+      const cur = resolveConfig();
+      const changed: string[] = [];
+
+      if (params.baseUrl) {
+        const u = normalizeBaseUrl(params.baseUrl);
+        await setProviderField("image", "baseUrl", u, ctx);
+        if (cur.audio) await setProviderField("audio", "baseUrl", u, ctx);
+        if (cur.video) await setProviderField("video", "baseUrl", u, ctx);
+        changed.push(`baseUrl → ${u} (image${cur.audio ? "+audio" : ""}${cur.video ? "+video" : ""})`);
+      }
+      if (params.model) {
+        await setProviderField("image", "model", params.model, ctx);
+        if (cur.video) await setProviderField("video", "model", params.model, ctx);
+        changed.push(`model → ${params.model} (image+video)`);
+      }
+      if (params.apiKey) {
+        await savePersisted({ apiKey: params.apiKey });
+        await setProviderField("image", "apiKey", params.apiKey, ctx);
+        if (cur.audio) await setProviderField("audio", "apiKey", params.apiKey, ctx);
+        if (cur.video) await setProviderField("video", "apiKey", params.apiKey, ctx);
+        changed.push("apiKey → set (hidden)");
+      }
+      if (params.consent) { await savePersisted({ consent: params.consent }); changed.push(`consent → ${params.consent}`); }
+      if (params.mode) { await savePersisted({ mode: params.mode }); changed.push(`mode → ${params.mode}`); }
+
+      const c = resolveConfig();
+      await showStatus(ctx);
+      return {
+        content: [{
+          type: "text",
+          text:
+            `✅ multi-content-proxy 已配置完成：\n` +
+            changed.map((x) => `- ${x}`).join("\n") +
+            `\n\n当前 image 配置：\n  baseUrl: ${c.image.baseUrl}\n  model:   ${c.image.model}\n  apiKey:  ${maskKey(c.apiKey || c.image.apiKey || "")}`,
+        }],
+      };
+    },
+  });
+  }
+
+  // Once the extension is configured, drop the configuration tool from the active
+  // tool set so it doesn't clutter the model's context. Re-show it if the config
+  // is later cleared (e.g. apiKey removed).
+  pi.on("before_agent_start", () => {
+    if (configuredAtLoad) return; // tool was never registered; nothing to toggle
+    const configured = isConfigured(resolveConfig());
+    const active = pi.getActiveTools();
+    const has = active.includes("configure_multi_content_proxy");
+    if (configured && has) {
+      pi.setActiveTools(active.filter((t) => t !== "configure_multi_content_proxy"));
+    } else if (!configured && !has) {
+      pi.setActiveTools([...active, "configure_multi_content_proxy"]);
+    }
+  });
+
 // ── Command helpers ─────────────────────────────────────────────────────────
 
 function classifyFromExt(ext: string): MediaKind | undefined {
