@@ -593,7 +593,7 @@ export default function (pi: ExtensionAPI) {
   const configuredAtLoad = isConfigured(resolveConfig());
 
   if (!configuredAtLoad) {
-  pi.tool({
+  pi.registerTool({
     name: "configure_multi_content_proxy",
     description: [
       "Configure the multi-content-proxy pi extension by setting its API endpoint, model, and key.",
