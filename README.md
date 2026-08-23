@@ -1,6 +1,6 @@
 # multi-content-proxy
 
-A [Pi](https://github.com/earendil-works/pi-coding-agent) agent extension that **parses image, audio, and video
+A [Pi](https://github.com/earendil-works/pi) agent extension that **parses image, audio, and video
 inputs** and forwards them to an OpenAI-compatible multimodal proxy so the agent can "see", "hear", and "watch"
 content that the underlying model wouldn't otherwise ingest natively.
 
